@@ -303,11 +303,19 @@ export const decryptMessageNode = (
 
 					let msgBuffer: Uint8Array
 
-					const decryptionJid = await getDecryptionJid(author, repository)
+					let decryptionJid = await getDecryptionJid(author, repository)
 
 					if (tag !== 'plaintext') {
 						// TODO: Handle hosted devices
 						await storeMappingFromEnvelope(stanza, author, repository, decryptionJid, logger)
+
+						// storeMappingFromEnvelope may have just migrated the session for `author`
+						// from its PN address to its LID address (deleting the PN-keyed session in
+						// the process). Re-resolve so this message decrypts against whichever
+						// address the session now actually lives under, instead of the stale
+						// pre-migration jid — otherwise the very message that taught us the mapping
+						// fails to decrypt and only the retry succeeds.
+						decryptionJid = await getDecryptionJid(author, repository)
 					}
 
 					try {
