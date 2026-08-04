@@ -16,7 +16,7 @@ import {
 	isPnUser
 	//	transferDevice
 } from '../WABinary'
-import { unpadRandomMax16 } from './generics'
+import { delay, unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
 
 export const getDecryptionJid = async (sender: string, repository: SignalRepositoryWithLIDStore): Promise<string> => {
@@ -57,7 +57,48 @@ export const ACCOUNT_RESTRICTED_TEXT = 'Your account has been restricted'
 export const DECRYPTION_RETRY_CONFIG = {
 	maxRetries: 3,
 	baseDelayMs: 100,
-	sessionRecordErrors: ['No session record', 'SessionError: No session record']
+	sessionRecordErrors: ['No session record', 'SessionError: No session record'],
+	// Thrown by GroupCipher.decrypt when a participant's first group message (or a rekey)
+	// arrives before their SenderKeyDistributionMessage has been processed. That message
+	// is sent as a separate stanza with no delivery-order guarantee vs. the group message
+	// itself, so it can legitimately still be in flight — worth a couple of short local
+	// retries before falling back to the full retry-receipt round trip.
+	missingSenderKeyErrors: ['No SenderKeyRecord found for decryption', 'No session found to decrypt message']
+}
+
+const GROUP_DECRYPT_RETRY_ATTEMPTS = 3
+const GROUP_DECRYPT_RETRY_DELAY_MS = 250
+
+const isMissingSenderKeyError = (error: any): boolean => {
+	const errorMessage = error?.message || error?.toString() || ''
+	return DECRYPTION_RETRY_CONFIG.missingSenderKeyErrors.some(pattern => errorMessage.includes(pattern))
+}
+
+const decryptGroupMessageWithRetry = async (
+	repository: SignalRepositoryWithLIDStore,
+	group: string,
+	authorJid: string,
+	msg: Uint8Array,
+	logger: ILogger
+): Promise<Uint8Array> => {
+	for (let attempt = 1; attempt <= GROUP_DECRYPT_RETRY_ATTEMPTS; attempt++) {
+		try {
+			return await repository.decryptGroupMessage({ group, authorJid, msg })
+		} catch (err) {
+			if (!isMissingSenderKeyError(err) || attempt === GROUP_DECRYPT_RETRY_ATTEMPTS) {
+				throw err
+			}
+
+			logger.debug(
+				{ group, authorJid, attempt },
+				'no sender key yet for group message, retrying shortly before falling back to retry-receipt'
+			)
+			await delay(GROUP_DECRYPT_RETRY_DELAY_MS)
+		}
+	}
+
+	// unreachable — the loop above always returns or throws
+	throw new Error('decryptGroupMessageWithRetry: exhausted retries')
 }
 
 /** NACK reason codes we send to the server (client → server) */
@@ -323,11 +364,7 @@ export const decryptMessageNode = (
 
 						switch (e2eType) {
 							case 'skmsg':
-								msgBuffer = await repository.decryptGroupMessage({
-									group: sender,
-									authorJid: author,
-									msg: content
-								})
+								msgBuffer = await decryptGroupMessageWithRetry(repository, sender, author, content, logger)
 								break
 							case 'pkmsg':
 							case 'msg':
